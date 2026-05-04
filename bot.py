@@ -625,8 +625,14 @@ def timeout(seconds):
             update = args[0] if args else None
             context = args[1] if len(args) > 1 else None
             # Перехват клавиатурных кнопок главного меню в любом FSM-шаге.
-            # `handle_main_menu` сам вызывает _handle_menu_escape бесполезно,
-            # поэтому исключаем её во избежание рекурсии.
+            # КРИТИЧНО: escape должен сработать ТОЛЬКО на самом внешнем вызове
+            # обёрнутого хендлера. Иначе, когда `handle_main_menu` сама вызывает
+            # обёрнутые `user_settings`, `class_management` и т.п., их обёртка
+            # снова увидит текст «⚙️ Настройки»/«🎓 Управление классами» и
+            # рекурсивно прыгнет обратно в handle_main_menu — вечный цикл.
+            # Флаг `_menu_escape_in_progress` ставится перед вызовом
+            # handle_main_menu из escape и снимается после возврата, что
+            # надёжно ломает рекурсию.
             try:
                 if (
                     update is not None
@@ -634,6 +640,10 @@ def timeout(seconds):
                     and getattr(func, "__name__", "") not in {"handle_main_menu", "_handle_menu_escape"}
                     and getattr(update, "message", None) is not None
                     and (update.message.text or "")
+                    and not (
+                        getattr(context, "user_data", None)
+                        and context.user_data.get("_menu_escape_in_progress", False)
+                    )
                 ):
                     escaped = await _handle_menu_escape(update, context)
                     if escaped is not None:
@@ -3532,7 +3542,15 @@ async def _handle_menu_escape(update, context):
     совпадающий с reply-кнопкой главного меню, — выходим из текущего состояния
     и сразу обрабатываем нажатие как клик главного меню. Возвращаем
     результирующее состояние или None, если это не кнопка меню (тогда
-    вызывающий хендлер продолжает работу штатно)."""
+    вызывающий хендлер продолжает работу штатно).
+
+    Перед вызовом `handle_main_menu` выставляем флаг
+    `_menu_escape_in_progress` в `context.user_data`, чтобы вложенные
+    обёртки (`@timeout`) не пытались делать повторный escape — иначе
+    `handle_main_menu` → `user_settings` → escape → `handle_main_menu` …
+    уйдёт в бесконечную рекурсию и пользователь увидит «настройки не
+    работают».
+    """
     if not getattr(update, "message", None) or not update.message.text:
         return None
     text = update.message.text.strip()
@@ -3548,11 +3566,17 @@ async def _handle_menu_escape(update, context):
             if renamed:
                 candidates.add(renamed)
     if text in candidates:
+        ud = getattr(context, "user_data", None)
+        if ud is not None:
+            ud["_menu_escape_in_progress"] = True
         try:
             return await handle_main_menu(update, context)
         except Exception as e:
             logger.error(f"menu escape failed: {e}")
             return None
+        finally:
+            if ud is not None:
+                ud.pop("_menu_escape_in_progress", None)
     return None
 
 
