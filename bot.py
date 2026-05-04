@@ -6918,14 +6918,21 @@ async def create_class_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     user.created_classes.append(class_code)
     save_user(user)
 
+    # Создатель класса автоматически становится его администратором, поэтому
+    # сразу обновляем reply-клавиатуру (там появится кнопка
+    # «👨‍💼 Админская панель») и **открываем эту панель** — пользователь
+    # ожидает увидеть инструменты управления сразу, а не лазать через меню.
     await update.message.reply_text(
         f"✅ Класс '{class_name}' создан!\n\n"
         f"🔑 Код класса: `{class_code}`\n\n"
-        f"Поделитесь этим кодом с одноклассниками!",
-        parse_mode="Markdown"
+        f"Поделитесь этим кодом с одноклассниками!\n\n"
+        f"Админская панель открыта ниже — можно сразу настраивать расписание, "
+        f"учителей и предметы.",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu_keyboard(user),
     )
 
-    return await class_management(update, context)
+    return await admin_panel(update, context)
 
 @timeout(CONVERSATION_TIMEOUT)
 async def join_class_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8019,7 +8026,10 @@ async def batch_add_teachers_start(update: Update, context: ContextTypes.DEFAULT
         "`Литература: Петров Иван Сергеевич`\n"
         "`Алгебра - Сидоров В.И.`\n\n"
         "Каждая строка — один предмет. Разделитель — `:` или `-`.\n"
-        "Если у учителя имени пока нет — оставь пустым: `Физика:`."
+        "Если у учителя имени пока нет — оставь пустым: `Физика:`.\n\n"
+        "⚠️ Это полный список — *предметы, которых нет в сообщении, будут "
+        "удалены* из класса (вместе с учителями). Так удобно одним заходом "
+        "перезаписать всё канонически."
     )
     await query.edit_message_text(
         text,
@@ -8052,14 +8062,17 @@ async def batch_add_teachers_handler(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("❌ Класс не найден.")
         return await admin_panel(update, context)
 
-    added = []
-    updated = []
+    # Пакетный ввод трактуется как ПОЛНЫЙ список — то есть после сохранения
+    # в классе остаются только те предметы, что упомянуты в этом сообщении.
+    # Всё, что было раньше и не попало в новый список, удаляется (и из
+    # `teachers`, и из `subjects`). Так у админа остаётся канонический
+    # список без накопленного мусора.
+    new_map = {}  # subj -> teacher
     skipped = []
     for raw_line in raw.split("\n"):
         line = raw_line.strip()
         if not line:
             continue
-        # Поддерживаем оба разделителя — двоеточие и тире.
         if ":" in line:
             subj, _, teacher = line.partition(":")
         elif "-" in line:
@@ -8072,24 +8085,48 @@ async def batch_add_teachers_handler(update: Update, context: ContextTypes.DEFAU
         if not subj:
             skipped.append(line)
             continue
-        if subj in class_obj.teachers:
-            class_obj.teachers[subj] = teacher
-            updated.append(f"{subj} → {teacher}")
-        else:
-            class_obj.teachers[subj] = teacher
-            if subj not in class_obj.subjects:
-                class_obj.subjects.append(subj)
+        new_map[subj] = teacher
+
+    if not new_map:
+        await update.message.reply_text(
+            "❌ Не удалось распарсить ни одной строки. Формат: `Предмет: Учитель` "
+            "(или через `-`). Попробуй ещё раз.",
+            parse_mode="Markdown",
+        )
+        return BATCH_ADD_TEACHERS
+
+    old_subjects = set(class_obj.teachers.keys()) | set(class_obj.subjects or [])
+    new_subjects = set(new_map.keys())
+
+    added = []
+    updated = []
+    removed = []
+
+    for subj, teacher in new_map.items():
+        old_teacher = class_obj.teachers.get(subj)
+        if old_teacher is None:
             added.append(f"{subj} → {teacher}")
+        elif old_teacher != teacher:
+            updated.append(f"{subj}: {old_teacher} → {teacher}")
+
+    for subj in old_subjects - new_subjects:
+        removed.append(subj)
+
+    # Полная замена: subjects и teachers становятся ровно тем, что прислал админ.
+    class_obj.teachers = dict(new_map)
+    class_obj.subjects = list(new_map.keys())
 
     classes = load_classes()
     classes[class_code] = class_obj
     save_classes(classes)
 
-    parts = ["✅ Готово!"]
+    parts = ["✅ Список учителей обновлён."]
     if added:
         parts.append("➕ Добавлено:\n" + "\n".join(f"• {x}" for x in added))
     if updated:
         parts.append("✏️ Обновлено:\n" + "\n".join(f"• {x}" for x in updated))
+    if removed:
+        parts.append("🗑 Удалено (не было в новом списке):\n" + "\n".join(f"• {x}" for x in removed))
     if skipped:
         parts.append("⚠️ Пропущено (нет «:» или «-»):\n" + "\n".join(f"• {x}" for x in skipped))
     await update.message.reply_text("\n\n".join(parts))
