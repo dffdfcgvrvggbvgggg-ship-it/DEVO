@@ -1,0 +1,14 @@
+# python-telegram-bot ставится с extra [job-queue], иначе application.job_queue
+# равен None и run_repeating не работает — ВСЕ уведомления (утро/вечер/ДР/погода/
+# праздники/таймеры) тихо отключаются. Это самая частая причина «не приходят
+# уведомления» при деплое на Render/Fly/Heroku.
+python-telegram-bot[job-queue]==21.6
+
+# AI-режим DEVO+ai — Groq SDK (асинхронный клиент).
+groq>=0.11.0,<1.0.0
+
+# HTTP-клиент и встроенный HTTP-сервер для Render health-check'ов.
+aiohttp>=3.9.0,<4.0.0
+
+# MongoDB — для синка пользователей/классов в Atlas.
+motor>=3.3.0,<4.0.0
