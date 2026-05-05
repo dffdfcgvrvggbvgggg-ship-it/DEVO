@@ -12222,26 +12222,71 @@ def build_application():
 
 async def run_bot(application):
     """Запускает поллинг Telegram. Корутина живёт, пока её не отменят
-    (SIGTERM/Ctrl+C); тогда корректно останавливает updater + application."""
+    (SIGTERM/Ctrl+C); тогда корректно останавливает updater + application.
+
+    Перед стартом polling'а:
+      1. Удаляем webhook (если когда-то был зарегистрирован) и
+         pending-апдейты — иначе getUpdates на токене с активным webhook
+         будет валиться 409 Conflict.
+      2. Если параллельно запущен второй инстанс бота с тем же токеном
+         (старый деплой не остановлен / локальная копия), Telegram кидает
+         `Conflict: terminated by other getUpdates request`. Молча падать
+         нельзя — иначе процесс рестартует, JobQueue (тикер уведомлений)
+         сбрасывается, и у пользователя пропадают утренние/вечерние/ДР.
+         Поэтому при `Conflict` логируем явное предупреждение и
+         перезапускаем polling с экспоненциальным backoff'ом, давая
+         старому инстансу шанс умереть.
+    """
+    from telegram.error import Conflict as TGConflict
+
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        # poll_interval=0.0 — сразу запрашиваем следующий long-poll апдейт без задержки,
-        # чтобы бот реагировал мгновенно. timeout=30 — long-poll держит соединение,
-        # так что лишних HTTP-запросов это не создаёт.
-        poll_interval=0.0,
-        timeout=30,
-    )
-    logger.info("Бот запущен (polling).")
+
+    # Сбрасываем webhook и накопившиеся апдейты — это ОБЯЗАТЕЛЬНО при
+    # переключении с webhook-режима на polling, и не вредит, если webhook'а
+    # никогда не было.
     try:
-        await asyncio.Event().wait()
-    finally:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook очищен (drop_pending_updates=True).")
+    except Exception as e:
+        logger.warning(f"delete_webhook не удался (не критично): {e}")
+
+    backoff = 5
+    started = False
+    try:
+        while True:
+            try:
+                await application.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                    poll_interval=0.0,
+                    timeout=30,
+                )
+                started = True
+                logger.info("Бот запущен (polling).")
+                break
+            except TGConflict as e:
+                logger.error(
+                    "Conflict: похоже, у бота уже работает другой инстанс с "
+                    "этим токеном (старый деплой/локальная копия?). "
+                    f"Жду {backoff} сек и пробую снова. Detail: {e}"
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 120)
+            except Exception as e:
+                logger.error(f"start_polling fatal: {e}")
+                raise
+
         try:
-            await application.updater.stop()
-        except Exception as e:
-            logger.error(f"updater.stop error: {e}")
+            await asyncio.Event().wait()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
+    finally:
+        if started:
+            try:
+                await application.updater.stop()
+            except Exception as e:
+                logger.error(f"updater.stop error: {e}")
         try:
             await application.stop()
         except Exception as e:
