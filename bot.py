@@ -1,4 +1,6 @@
 import os
+import io
+import base64
 import json
 import logging
 import random
@@ -41,6 +43,11 @@ BOT_TOKEN = _env("BOT_TOKEN")
 DEVELOPER_ID = _env("DEVELOPER_ID")
 GROQ_API_KEY = _env("GROQ_API_KEY")
 GROQ_MODEL = _env("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Вижн-модель Groq для обработки фотографий. Используется только если в
+# сообщении пользователя есть фото. Требует поддержку multimodal со стороны
+# Groq, поэтому хранится отдельно от GROQ_MODEL (текстовая модель не умеет
+# принимать image_url).
+GROQ_VISION_MODEL = _env("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 # WeatherAPI ключ. По умолчанию — ключ, выданный пользователем; при необходимости
 # можно переопределить через переменную окружения WEATHER_API_KEY.
 WEATHER_API_KEY = _env("WEATHER_API_KEY", "62ee0b66d804499d95e153315263004")
@@ -1905,10 +1912,17 @@ def get_homework_for_date(class_obj, date_str):
     return homework_for_date if homework_for_date else None
 
 def format_homework(homework_dict, date_str=None):
+    """Форматирует домашние задания. Показывает текст задания, дату «когда
+    нужно сделать» и дату «когда добавлено» (если она сохранена в записи).
+
+    Поле `added_at` пишется при создании ДЗ в save_homework_handler;
+    для старых записей этого поля может не быть — тогда показываем только
+    «дата выполнения».
+    """
     if not homework_dict:
         return "📝 Домашнее задание не задано."
 
-    header = f"📝 **Домашнее задание"
+    header = "📝 **Домашнее задание"
     if date_str:
         header += f" на {date_str}"
     header += ":**\n\n"
@@ -1917,7 +1931,14 @@ def format_homework(homework_dict, date_str=None):
     for subject, assignments in homework_dict.items():
         text += f"**{subject}:**\n"
         for assignment in assignments:
-            text += f"• {assignment['text']}\n"
+            line = f"• {assignment.get('text', '')}"
+            due = assignment.get('date')
+            if due and not date_str:
+                line += f"\n   📅 На дату: {due}"
+            added = assignment.get('added_at')
+            if added:
+                line += f"\n   🕒 Добавлено: {added}"
+            text += line + "\n"
         text += "\n"
 
     return text
@@ -2825,15 +2846,20 @@ async def _ai_thinking_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     Не должен валить основной хендлер, поэтому все исключения глотаем.
     Цикл прерывается через asyncio.CancelledError из основной корутины.
     """
+    # Приятная анимация размышления: перебираются эмодзи и прогресс-бар,
+    # фазы отличаются лексикой, чтобы не выглядело однообразно.
     frames = [
-        "🤖 DEVO+ai думает   ⏳",
-        "🤖 DEVO+ai думает.  ⏳",
-        "🤖 DEVO+ai думает.. ⏳",
-        "🤖 DEVO+ai думает...⏳",
-        "🤖 DEVO+ai размышляет 💭",
-        "🤖 DEVO+ai размышляет 💭.",
-        "🤖 DEVO+ai размышляет 💭..",
-        "🤖 DEVO+ai размышляет 💭...",
+        "✨ DEVO+ai анализирую запрос   🔍\n▘▖▖▖▖▖▖▖▖▖ 0%",
+        "💡 DEVO+ai подбираю идеи     ✨\n▌▖▖▖▖▖▖▖▖▖ 10%",
+        "🧠 DEVO+ai размышляю        💭\n█▖▖▖▖▖▖▖▖▖ 20%",
+        "⚙️ DEVO+ai собираю логику    🔩\n█▌▖▖▖▖▖▖▖▖ 30%",
+        "📚 DEVO+ai вспоминаю факты   🧩\n██▖▖▖▖▖▖▖▖ 40%",
+        "🔬 DEVO+ai разбираю детали   ✨\n██▌▖▖▖▖▖▖▖ 50%",
+        "📝 DEVO+ai формулирую ответ ✍️\n███▖▖▖▖▖▖▖ 60%",
+        "🎨 DEVO+ai привожу в вид       💫\n███▌▖▖▖▖▖▖ 70%",
+        "🔍 DEVO+ai проверяю факты    ✅\n████▖▖▖▖▖▖ 80%",
+        "⏳ DEVO+ai почти готово        💯\n████▌▖▖▖▖▖ 90%",
+        "🚀 DEVO+ai отправляю ответ    🎉\n█████▖▖▖▖▖ 95%",
     ]
     i = 0
     try:
@@ -2866,10 +2892,18 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ПУНКТ 4: пока модель отвечает, пользователю показывается анимированное
     сообщение «DEVO+ai думает…», которое затем заменяется на реальный ответ.
+
+    НОВОЕ: поддержка фото (Groq Vision). Если в сообщении есть фото —
+    оно скачивается, кодируется в base64 и отправляется в вижн-модель
+    Groq (`GROQ_VISION_MODEL`, по умолчанию «llama-3.2-90b-vision-preview»).
+    Сама история разговора хранит текстовую выжимку фото
+    («[фото: …]»), чтобы не раздувать базу.
     """
     user_id = str(update.effective_user.id)
-    user_message = (update.message.text or "").strip()
+    msg = update.message
+    user_message = (msg.text or msg.caption or "").strip()
     chat_id = update.effective_chat.id
+    has_photo = bool(getattr(msg, "photo", None))
 
     # 1) Сразу шлём «typing», чтобы у клиента появилась анимация набора текста
     try:
@@ -2897,10 +2931,30 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "content": "Ты должен отвечать ТОЛЬКО на русском языке, независимо от языка запроса пользователя."
         })
 
+    # Если пришло фото — скачиваем самое крупное и кодируем в base64.
+    photo_data_url = None
+    if has_photo:
+        try:
+            largest = msg.photo[-1]
+            tg_file = await context.bot.get_file(largest.file_id)
+            buf = io.BytesIO()
+            await tg_file.download_to_memory(out=buf)
+            buf.seek(0)
+            b64 = base64.b64encode(buf.read()).decode("ascii")
+            photo_data_url = f"data:image/jpeg;base64,{b64}"
+        except Exception as e:
+            logger.warning(f"AI: не удалось скачать фото: {e}")
+            photo_data_url = None
+
     # История: пользовательское сообщение добавляем до запроса, но ограничиваем длину,
     # а при ошибке запроса — откатываем, чтобы не копить «висячие» user-сообщения.
+    history_text = user_message if user_message else ("[фото]" if has_photo else "")
+    if has_photo and user_message:
+        history_text = f"[фото] {user_message}"
+    elif has_photo:
+        history_text = "[фото]"
     user_conversations[user_id].append(
-        {"role": "user", "content": user_message}
+        {"role": "user", "content": history_text}
     )
     # Оставляем system + последние 20 сообщений
     if len(user_conversations[user_id]) > 21:
@@ -2915,16 +2969,34 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (asyncio.CancelledError, Exception):
                 pass
 
+    # Подготовка messages: для запроса в вижн-модель кладём фото отдельным
+    # multimodal-сообщением; в локальной истории остаётся только текстовая
+    # выжимка, чтобы не раздувать кэш.
+    if photo_data_url:
+        request_messages = list(user_conversations[user_id][:-1])
+        prompt_text = user_message or "Опиши, что изображено на фото, и ответь на возможный вопрос пользователя."
+        request_messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": photo_data_url}},
+            ],
+        })
+        request_model = GROQ_VISION_MODEL
+    else:
+        request_messages = user_conversations[user_id]
+        request_model = GROQ_MODEL
+
     ai_response = None
     try:
         chat_completion = await asyncio.wait_for(
             groq_client.chat.completions.create(
-                messages=user_conversations[user_id],
-                model=GROQ_MODEL,
+                messages=request_messages,
+                model=request_model,
                 temperature=0.7,
                 max_tokens=2048,
             ),
-            timeout=60,
+            timeout=120 if photo_data_url else 60,
         )
         ai_response = chat_completion.choices[0].message.content or ""
     except asyncio.TimeoutError:
@@ -3872,6 +3944,35 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 @timeout(CONVERSATION_TIMEOUT)
+async def handle_main_menu_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фото в главном меню.
+
+    В режиме AI (`ai_mode == True`) фото уходит в Groq Vision через
+    `handle_ai_message`. В обычном режиме отвечаем подсказкой, чтобы
+    пользователь сначала зашёл в AI-режим.
+    """
+    user_id = str(update.effective_user.id)
+    if not await ensure_subscribed(update, context):
+        return MAIN_MENU
+    if is_user_blocked(user_id):
+        await send_blocked_message(update, context, user_id)
+        return ConversationHandler.END
+
+    user = get_user(user_id) or User(user_id)
+
+    if context.user_data.get('ai_mode'):
+        await handle_ai_message(update, context)
+        return MAIN_MENU
+
+    await update.message.reply_text(
+        "🖼 Чтобы я мог посмотреть фото — сначала зайдите в режим AI "
+        "(кнопка «🤖 AI» в меню), а потом отправьте фото.",
+        reply_markup=get_main_menu_keyboard(user),
+    )
+    return MAIN_MENU
+
+
+@timeout(CONVERSATION_TIMEOUT)
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
 
@@ -4000,7 +4101,11 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif message_text == "📢 Написать классу":
         if class_obj and str(user_id) in class_obj.admins:
             context.user_data['current_admin_class'] = class_obj.class_code
-            await update.message.reply_text("📢 Введите сообщение для отправки всему классу:")
+            await update.message.reply_text(
+                "📢 Введите сообщение для отправки всему классу:\n\n"
+                "Чтобы отменить — нажмите кнопку ниже.",
+                reply_markup=get_cancel_keyboard(),
+            )
             return SEND_CLASS_MESSAGE
         else:
             await update.message.reply_text("❌ У вас нет прав администратора.")
@@ -11853,11 +11958,59 @@ async def _tick_send_timers(bot):
             logger.error(f"tick/timers: final save failed: {e}")
 
 
+async def _tick_broadcast_birthday_to_class(bot, user):
+    """Уведомляет одноклассников именинника, что у него сегодня ДР.
+
+    ВАЖНО: самому имениннику в класс ЭТО НЕ присылаем — пользователь
+    жаловался, что приходит «у меня сегодня ДР» ему же самому. Поэтому
+    в цикле явно скипаем `member_id == user.user_id`.
+
+    Срабатывает только если у пользователя включён `show_birthday_to_class`.
+    Дубль-защита от ежесекундной рассылки — по тому же журналу, ключ
+    `birthday_class_<user_id>` помечается датой отправки.
+    """
+    try:
+        if not getattr(user, 'show_birthday_to_class', True):
+            return
+        if not getattr(user, 'birthday', None):
+            return
+        try:
+            class_obj = get_class_by_user(user.user_id)
+        except Exception as e:
+            logger.error(f"birthday_class_broadcast: get_class_by_user failed: {e}")
+            return
+        if not class_obj:
+            return
+        members = list(set(
+            (getattr(class_obj, 'students', []) or [])
+            + (getattr(class_obj, 'admins', []) or [])
+        ))
+        text = (
+            f"🎂 Сегодня день рождения у "
+            f"{user.first_name or 'одноклассник(а)'}!\n\n"
+            f"Не забудьте поздравить 🎉"
+        )
+        for member_id in members:
+            try:
+                # Пропускаем самого именинника — ему это не нужно.
+                if str(member_id) == str(user.user_id):
+                    continue
+                await bot.send_message(chat_id=int(member_id), text=text)
+            except Exception as e:
+                logger.error(
+                    f"birthday_class_broadcast: send to {member_id} failed: {e}"
+                )
+    except Exception as e:
+        logger.error(f"birthday_class_broadcast: top-level error: {e}")
+
+
 async def _tick_send_birthday_for_user(bot, user, log, local_today_str):
     """Отправляет уведомление «через сколько дней мой ДР» / поздравление в сам
-    день рождения. Соблюдает birthday_personal_notification."""
-    if not getattr(user, 'birthday_personal_notification', True):
-        return
+    день рождения. Соблюдает birthday_personal_notification.
+
+    Если сегодня ДР и включён `show_birthday_to_class` — параллельно
+    шлём короткое уведомление одноклассникам (без самого именинника).
+    """
     if not getattr(user, 'birthday', None):
         return
     user_id = user.user_id
@@ -11871,18 +12024,28 @@ async def _tick_send_birthday_for_user(bot, user, log, local_today_str):
             (birthday.month, birthday.day) == (local_today.month, local_today.day)
         )
         if is_birthday_today:
-            years = local_today.year - birthday.year
-            if (local_today.month, local_today.day) < (birthday.month, birthday.day):
-                years -= 1
-            import random as _rnd
-            greeting = _rnd.choice(BIRTHDAY_GREETINGS).format(
-                name=user.first_name or "друг"
-            )
-            message = greeting
-            if years >= 1:
-                message += f"\n\n🎁 Тебе сегодня исполняется {years}!"
-            await bot.send_message(chat_id=int(user_id), text=message)
+            # Личное поздравление — только если включено.
+            if getattr(user, 'birthday_personal_notification', True):
+                years = local_today.year - birthday.year
+                if (local_today.month, local_today.day) < (birthday.month, birthday.day):
+                    years -= 1
+                import random as _rnd
+                greeting = _rnd.choice(BIRTHDAY_GREETINGS).format(
+                    name=user.first_name or "друг"
+                )
+                message = greeting
+                if years >= 1:
+                    message += f"\n\n🎁 Тебе сегодня исполняется {years}!"
+                try:
+                    await bot.send_message(chat_id=int(user_id), text=message)
+                except Exception as e:
+                    logger.error(f"tick/birthday personal {user_id}: {e}")
+            # Уведомление одноклассникам (без самого именинника).
+            await _tick_broadcast_birthday_to_class(bot, user)
         else:
+            if not getattr(user, 'birthday_personal_notification', True):
+                _mark_notification_sent(log, user_id, 'birthday', local_today_str)
+                return
             days_left = _days_until_birthday_for_user(user)
             if days_left is None or days_left <= 0:
                 return
@@ -11965,13 +12128,25 @@ async def _unified_notification_tick(context: ContextTypes.DEFAULT_TYPE):
                 and joined_local_date == local_now.date()
             )
 
-            # 2a) Утреннее
+            # 2a) Утреннее.
+            # ИСПРАВЛЕНИЕ (по жалобе пользователя «не приходят утренние»):
+            # окно «опоздания» увеличено с 6 до 14 часов. На бесплатных
+            # хостингах сервис мог просыпать всё утро, и старое 360-минутное
+            # окно превращало пропуск в «помечено как отправлено». Теперь —
+            # если бот проснулся хоть к ужину, утреннее всё равно догонит.
             if getattr(user, 'notifications', True):
                 morning_t = getattr(user, 'morning_notification_time', '08:00') or '08:00'
-                due, too_late = _is_time_due(local_now, morning_t)
+                due, too_late = _is_time_due(
+                    local_now, morning_t, max_late_minutes=14 * 60
+                )
+                logger.info(
+                    f"unified_tick: morning check uid={uid} t={morning_t} "
+                    f"local_now={local_now:%H:%M} due={due} too_late={too_late} "
+                    f"sent_today={_notification_already_sent(log, uid, 'morning', local_today_str)} "
+                    f"reg_today={registered_today}"
+                )
                 if not _notification_already_sent(log, uid, 'morning', local_today_str):
                     if registered_today:
-                        # День регистрации — глушим, помечаем как отправленное.
                         _mark_notification_sent(log, uid, 'morning', local_today_str)
                         log_changed = True
                     elif due:
@@ -11986,19 +12161,27 @@ async def _unified_notification_tick(context: ContextTypes.DEFAULT_TYPE):
                         except Exception as e:
                             logger.error(f"unified_tick: morning {uid}: {e}")
                     elif too_late:
-                        # Слишком поздно отправлять утреннее (хостинг проспал
-                        # большую часть дня) — пометим как «отправлено», чтобы
-                        # завтра уведомление пришло вовремя.
                         _mark_notification_sent(log, uid, 'morning', local_today_str)
                         log_changed = True
 
-            # 2b) Вечернее
+            # 2b) Вечернее. Тоже расширили окно — до 8 часов.
+            # Меньше, чем у утра, потому что вечернее в 22:00 + 14ч = 12:00
+            # завтра, и оно бы ушло уже в обед, что выглядит странно.
+            # 8 часов же = 22:00 → 06:00 «следующего астрономического утра»,
+            # что нормально воспринимается как «опоздавшее ночное».
             if getattr(user, 'notifications', True):
                 evening_t = getattr(user, 'evening_notification_time', '22:00') or '22:00'
-                due, too_late = _is_time_due(local_now, evening_t)
+                due, too_late = _is_time_due(
+                    local_now, evening_t, max_late_minutes=8 * 60
+                )
+                logger.info(
+                    f"unified_tick: evening check uid={uid} t={evening_t} "
+                    f"local_now={local_now:%H:%M} due={due} too_late={too_late} "
+                    f"sent_today={_notification_already_sent(log, uid, 'evening', local_today_str)} "
+                    f"reg_today={registered_today}"
+                )
                 if not _notification_already_sent(log, uid, 'evening', local_today_str):
                     if registered_today:
-                        # День регистрации — глушим, помечаем как отправленное.
                         _mark_notification_sent(log, uid, 'evening', local_today_str)
                         log_changed = True
                     elif due:
@@ -12644,6 +12827,9 @@ def main():
             ],
             MAIN_MENU: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu),
+                # Фото в режиме AI: добавлено для поддержки Groq Vision —
+                # пользователь может прислать фото в чат с AI и получить ответ.
+                MessageHandler(filters.PHOTO, handle_main_menu_photo),
                 CallbackQueryHandler(handle_callback),
             ],
             CLASS_MANAGEMENT: [
